@@ -1,1 +1,13 @@
 /target/
+
+# Generated market data
+*.sbe
+
+# Local backups
+*.before-*
+*.pre-collector-backup
+
+# Credentials
+.env
+*.pem
+*.key
