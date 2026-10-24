@@ -1,3 +1,5 @@
+mod orderbook;
+
 use chrono::DateTime;
 use engineering_challenge::Side;
 use engineering_challenge::util::dtos::challenge_orderbook::{
