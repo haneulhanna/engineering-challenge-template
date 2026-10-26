@@ -1,5 +1,5 @@
 use crate::orderbook::Outcome;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -30,9 +30,6 @@ pub enum BookEvent {
     },
 }
 
-fn millis(ms: i64) -> Result<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp_millis(ms).context("invalid millisecond timestamp")
-}
 fn message_time(value: &Value, key: &str) -> Option<DateTime<Utc>> {
     value
         .get(key)

@@ -8,6 +8,10 @@ use engineering_challenge::util::AlignedSbeWriter;
 use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
 use kalshi::{BookEvent, Credentials, DEFAULT_REST, DEFAULT_WS};
 use orderbook::OrderBook;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -31,6 +35,7 @@ struct Worker {
     target: watch::Sender<Vec<String>>,
     reset: mpsc::Sender<()>,
     join: JoinHandle<()>,
+    epoch: Arc<AtomicU64>,
 }
 
 struct Engine {
@@ -106,10 +111,56 @@ fn shard_sets(all: &[String], per_socket: usize) -> Vec<Vec<String>> {
     all.chunks(per_socket).map(|part| part.to_vec()).collect()
 }
 
+/// Plan subscription changes and invalidate books whose socket membership changes.
+/// A retained market still needs a fresh snapshot when its shard resubscribes.
+fn reconcile_market_refresh(
+    names: &[String],
+    per_socket: usize,
+    previous_chunks: &[Vec<String>],
+    states: &mut HashMap<String, State>,
+    owners: &mut HashMap<String, usize>,
+) -> Option<Vec<Vec<String>>> {
+    let mut sorted = names.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let chunks = shard_sets(&sorted, per_socket);
+    // update_workers keeps empty workers at the end when market counts shrink.
+    let active_previous: Vec<Vec<String>> = previous_chunks
+        .iter()
+        .filter(|chunk| !chunk.is_empty())
+        .cloned()
+        .collect();
+    if chunks == active_previous {
+        return None;
+    }
+
+    let mut next_owners = HashMap::new();
+    for (shard, symbols) in chunks.iter().enumerate() {
+        for symbol in symbols {
+            next_owners.insert(symbol.clone(), shard);
+        }
+    }
+
+    // If the contents of a shard changed, its socket will resubscribe.
+    // Invalidate every old book on that shard, including markets that
+    // stay on the same shard, so no stale state can be snapshotted.
+    for (shard, previous) in active_previous.iter().enumerate() {
+        if chunks.get(shard) != Some(previous) {
+            for symbol in previous {
+                states.remove(symbol);
+            }
+        }
+    }
+    // Never retain a book for a market that is no longer active.
+    states.retain(|symbol, _| next_owners.contains_key(symbol));
+    *owners = next_owners;
+    Some(chunks)
+}
+
 fn update_workers(
     chunks: Vec<Vec<String>>,
     workers: &mut Vec<Worker>,
-    event_tx: &mpsc::Sender<(usize, BookEvent)>,
+    event_tx: &mpsc::Sender<(usize, u64, BookEvent)>,
     shutdown: &watch::Receiver<bool>,
     auth: &Credentials,
     ws_url: &str,
@@ -120,6 +171,7 @@ fn update_workers(
         if i >= workers.len() {
             let (target, receiver) = watch::channel(chunk.clone());
             let (reset, reset_rx) = mpsc::channel(4);
+            let epoch = Arc::new(AtomicU64::new(0));
             let join = tokio::spawn(collector::run_shard(
                 i,
                 receiver,
@@ -128,18 +180,25 @@ fn update_workers(
                 event_tx.clone(),
                 auth.clone(),
                 ws_url.to_owned(),
+                epoch.clone(),
             ));
             workers.push(Worker {
                 target,
                 reset,
                 join,
+                epoch,
             });
         } else if *workers[i].target.borrow() != *chunk {
+            // Immediately reject queued data from the old subscription.
+            workers[i].epoch.fetch_add(1, Ordering::SeqCst);
             workers[i].target.send_replace(chunk.clone());
         }
     }
     for worker in workers.iter().skip(chunks.len()) {
-        worker.target.send_replace(Vec::new());
+        if !worker.target.borrow().is_empty() {
+            worker.epoch.fetch_add(1, Ordering::SeqCst);
+            worker.target.send_replace(Vec::new());
+        }
     }
 }
 
@@ -174,6 +233,22 @@ fn filter_event_by_owner(
             }
         }
     }
+}
+
+/// A shard index alone is insufficient: a restarted connection may produce
+/// delayed queued messages from the previous subscription on that same shard.
+fn filter_event_by_session(
+    shard: usize,
+    session_epoch: u64,
+    event: BookEvent,
+    owners: &HashMap<String, usize>,
+    workers: &[Worker],
+) -> Option<BookEvent> {
+    let current_epoch = workers.get(shard)?.epoch.load(Ordering::SeqCst);
+    if session_epoch != current_epoch {
+        return None;
+    }
+    filter_event_by_owner(shard, event, owners)
 }
 
 fn apply_output(engine: &mut Engine, shard: usize, event: BookEvent, workers: &[Worker]) {
@@ -213,7 +288,6 @@ async fn replay(path: &str, engine: &mut Engine) -> Result<()> {
 
 // Probe a single connection before spawning any market collection workers.
 async fn verify_kalshi_auth(auth: &Credentials, ws_url: &str) -> Result<()> {
-    use futures_util::SinkExt;
     eprintln!("Checking Kalshi WebSocket authentication (one connection only)...");
     let request = auth.websocket_request(ws_url)?;
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
@@ -266,7 +340,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(25))
         .build()?;
-    let (event_tx, mut event_rx) = mpsc::channel::<(usize, BookEvent)>(16_384);
+    let (event_tx, mut event_rx) = mpsc::channel::<(usize, u64, BookEvent)>(16_384);
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut workers: Vec<Worker> = Vec::new();
     let mut current: HashSet<String> = HashSet::new();
@@ -291,25 +365,28 @@ async fn main() -> Result<()> {
                         }
 
                         let desired: HashSet<String> = names.iter().cloned().collect();
-                        for removed in current.difference(&desired) { engine.states.remove(removed); }
                         if desired != current {
                             eprintln!("discovered {} open regular markets", names.len());
-                            let chunks = shard_sets(&names, per_socket);
-                            let mut next_owners = HashMap::new();
-                            for (shard, symbols) in chunks.iter().enumerate() {
-                                for symbol in symbols {
-                                    next_owners.insert(symbol.clone(), shard);
-                                }
+                            let previous_chunks: Vec<Vec<String>> = workers
+                                .iter()
+                                .map(|worker| worker.target.borrow().clone())
+                                .collect();
+                            if let Some(chunks) = reconcile_market_refresh(
+                                &names,
+                                per_socket,
+                                &previous_chunks,
+                                &mut engine.states,
+                                &mut owners,
+                            ) {
+                                update_workers(
+                                    chunks,
+                                    &mut workers,
+                                    &event_tx,
+                                    &stop_rx,
+                                    &auth,
+                                    &ws_url,
+                                );
                             }
-                            // A book is invalid if its market moved to another shard.
-                            for (symbol, previous_shard) in &owners {
-                                if next_owners.get(symbol) != Some(previous_shard) {
-                                    engine.states.remove(symbol);
-                                }
-                            }
-                            owners = next_owners;
-                            update_workers(chunks, &mut workers, &event_tx,
-                                &stop_rx, &auth, &ws_url);
                             current = desired;
                         }
                     }
@@ -317,8 +394,8 @@ async fn main() -> Result<()> {
                 }
             }
             maybe_event = event_rx.recv() => {
-                if let Some((shard, event)) = maybe_event {
-                    if let Some(event) = filter_event_by_owner(shard, event, &owners) {
+                if let Some((shard, session_epoch, event)) = maybe_event {
+                    if let Some(event) = filter_event_by_session(shard, session_epoch, event, &owners, &workers) {
                         if let BookEvent::Snapshot { symbol, .. } = &event {
                             eprintln!("DEBUG: received snapshot for {symbol}");
                         }
@@ -332,12 +409,13 @@ async fn main() -> Result<()> {
     stop_tx.send_replace(true);
     // Allow each worker to close its socket before the last flush. Timeout guards
     // against a connection stuck during handshake or IO.
-    for worker in workers {
-        let _ = tokio::time::timeout(Duration::from_secs(3), worker.join).await;
+    for worker in &mut workers {
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut worker.join).await;
     }
     drop(event_tx);
-    while let Ok((shard, event)) = event_rx.try_recv() {
-        if let Some(event) = filter_event_by_owner(shard, event, &owners) {
+    while let Ok((shard, session_epoch, event)) = event_rx.try_recv() {
+        if let Some(event) = filter_event_by_session(shard, session_epoch, event, &owners, &workers)
+        {
             apply_output(&mut engine, shard, event, &[]);
         }
     }
@@ -465,5 +543,147 @@ mod shard_ownership_regression {
             panic!("expected owned invalidation");
         };
         assert_eq!(symbols, vec!["A".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_market_regression {
+    use super::*;
+
+    fn state() -> State {
+        State {
+            book: OrderBook::from_snapshot(&[("0.40".to_string(), "1.00".to_string())], &[])
+                .unwrap(),
+            exchange: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn adding_market_preserves_unchanged_shards() {
+        let old = vec![vec!["A".to_string(), "B".to_string()]];
+        let mut states = HashMap::from([("A".to_string(), state()), ("B".to_string(), state())]);
+        let mut owners = HashMap::from([("A".to_string(), 0usize), ("B".to_string(), 0usize)]);
+        let markets = ["A".to_string(), "B".to_string(), "C".to_string()];
+        let next = reconcile_market_refresh(&markets, 2, &old, &mut states, &mut owners)
+            .expect("added market should change subscription plan");
+        assert_eq!(
+            next,
+            vec![
+                vec!["A".to_string(), "B".to_string()],
+                vec!["C".to_string()],
+            ]
+        );
+        assert!(states.contains_key("A"));
+        assert!(states.contains_key("B"));
+        assert_eq!(owners.get("C"), Some(&1));
+    }
+
+    #[test]
+    fn removing_market_invalidates_even_same_shard_survivors() {
+        let old = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["C".to_string()],
+        ];
+        let mut states = HashMap::from([
+            ("A".to_string(), state()),
+            ("B".to_string(), state()),
+            ("C".to_string(), state()),
+        ]);
+        let mut owners = HashMap::from([
+            ("A".to_string(), 0usize),
+            ("B".to_string(), 0usize),
+            ("C".to_string(), 1usize),
+        ]);
+        // B remains on shard 0 but shard 0 must resubscribe after A goes away.
+        let markets = ["B".to_string(), "C".to_string()];
+        let next = reconcile_market_refresh(&markets, 2, &old, &mut states, &mut owners)
+            .expect("removal should change subscription plan");
+        assert_eq!(next, vec![vec!["B".to_string(), "C".to_string()]]);
+        assert!(
+            states.is_empty(),
+            "all books on changing shards must be invalidated"
+        );
+        assert!(!owners.contains_key("A"));
+        assert_eq!(owners.get("B"), Some(&0));
+        assert_eq!(owners.get("C"), Some(&0));
+    }
+
+    #[test]
+    fn unchanged_membership_does_not_clear_books() {
+        let old = vec![vec!["A".to_string()], vec![]];
+        let mut states = HashMap::from([("A".to_string(), state())]);
+        let mut owners = HashMap::from([("A".to_string(), 0usize)]);
+        let markets = ["A".to_string()];
+        let next = reconcile_market_refresh(&markets, 2, &old, &mut states, &mut owners);
+        assert!(next.is_none());
+        assert!(states.contains_key("A"));
+        assert_eq!(owners.get("A"), Some(&0));
+    }
+}
+
+#[cfg(test)]
+mod session_generation_regression {
+    use super::*;
+
+    fn workers_for_test(epoch: Arc<AtomicU64>) -> Vec<Worker> {
+        let (target, _receiver) = watch::channel(vec!["A".to_string()]);
+        let (reset, _reset_receiver) = mpsc::channel(1);
+        let join = tokio::spawn(async {});
+        vec![Worker {
+            target,
+            reset,
+            join,
+            epoch,
+        }]
+    }
+
+    #[tokio::test]
+    async fn old_connection_cannot_invalidate_reconnected_book() {
+        let epoch = Arc::new(AtomicU64::new(1));
+        let workers = workers_for_test(epoch.clone());
+        let owners = HashMap::from([("A".to_owned(), 0usize)]);
+
+        let previous = BookEvent::Invalidate(vec!["A".into()]);
+        assert!(filter_event_by_session(0, 1, previous, &owners, &workers).is_some());
+
+        // A new connection on the SAME shard replaces the prior subscription.
+        epoch.store(2, Ordering::SeqCst);
+        let stale = BookEvent::Invalidate(vec!["A".into()]);
+        assert!(filter_event_by_session(0, 1, stale, &owners, &workers).is_none());
+        let current = BookEvent::Invalidate(vec!["A".into()]);
+        assert!(filter_event_by_session(0, 2, current, &owners, &workers).is_some());
+    }
+
+    #[tokio::test]
+    async fn old_connection_snapshot_and_delta_are_rejected() {
+        let epoch = Arc::new(AtomicU64::new(7));
+        let workers = workers_for_test(epoch);
+        let owners = HashMap::from([("A".to_owned(), 0usize)]);
+        let now = Utc::now();
+        let old_snapshot = BookEvent::Snapshot {
+            symbol: "A".into(),
+            yes: vec![],
+            no: vec![],
+            received: now,
+            exchange: now,
+        };
+        assert!(filter_event_by_session(0, 6, old_snapshot, &owners, &workers).is_none());
+        let old_delta = BookEvent::Delta {
+            symbol: "A".into(),
+            outcome: crate::orderbook::Outcome::Yes,
+            price: 400_000,
+            delta: 1_000_000,
+            received: now,
+            exchange: now,
+        };
+        assert!(filter_event_by_session(0, 6, old_delta, &owners, &workers).is_none());
+        let new_snapshot = BookEvent::Snapshot {
+            symbol: "A".into(),
+            yes: vec![],
+            no: vec![],
+            received: now,
+            exchange: now,
+        };
+        assert!(filter_event_by_session(0, 7, new_snapshot, &owners, &workers).is_some());
     }
 }

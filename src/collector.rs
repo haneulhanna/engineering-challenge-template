@@ -2,6 +2,10 @@ use crate::kalshi::{BookEvent, Credentials, parse_message};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -13,9 +17,10 @@ pub async fn run_shard(
     mut target: watch::Receiver<Vec<String>>,
     mut reset: mpsc::Receiver<()>,
     mut shutdown: watch::Receiver<bool>,
-    output: mpsc::Sender<(usize, BookEvent)>,
+    output: mpsc::Sender<(usize, u64, BookEvent)>,
     credentials: Credentials,
     ws_url: String,
+    epoch: Arc<AtomicU64>,
 ) {
     let mut backoff = 1u64;
     loop {
@@ -30,9 +35,11 @@ pub async fn run_shard(
             }
             continue;
         }
+        // Assign a new generation before emitting the initial invalidation.
+        let session_epoch = epoch.fetch_add(1, Ordering::SeqCst) + 1;
         // Drop any existing book state before connecting/reconnecting.
         if output
-            .send((shard, BookEvent::Invalidate(current.clone())))
+            .send((shard, session_epoch, BookEvent::Invalidate(current.clone())))
             .await
             .is_err()
         {
@@ -40,6 +47,7 @@ pub async fn run_shard(
         }
         let session = run_session(
             shard,
+            session_epoch,
             &current,
             &mut target,
             &mut reset,
@@ -52,7 +60,7 @@ pub async fn run_shard(
         // The socket no longer owns valid state, including symbols removed or
         // moved to another shard by a refresh.
         if output
-            .send((shard, BookEvent::Invalidate(current.clone())))
+            .send((shard, session_epoch, BookEvent::Invalidate(current.clone())))
             .await
             .is_err()
         {
@@ -76,13 +84,25 @@ pub async fn run_shard(
     }
 }
 
+fn check_sequence(last: &mut Option<i64>, next: i64) -> Result<()> {
+    if let Some(previous) = *last {
+        if previous.checked_add(1) != Some(next) {
+            bail!("sequence gap: {previous} -> {next}");
+        }
+    }
+
+    *last = Some(next);
+    Ok(())
+}
+
 async fn run_session(
     shard: usize,
+    session_epoch: u64,
     markets: &[String],
     target: &mut watch::Receiver<Vec<String>>,
     reset: &mut mpsc::Receiver<()>,
     shutdown: &mut watch::Receiver<bool>,
-    output: &mpsc::Sender<(usize, BookEvent)>,
+    output: &mpsc::Sender<(usize, u64, BookEvent)>,
     credentials: &Credentials,
     ws_url: &str,
 ) -> Result<()> {
@@ -122,10 +142,7 @@ async fn run_session(
                         // seq is scoped to a Kalshi subscription, not a market clock.
                         if let Some(seq) = value["seq"].as_i64() {
                             if sid.is_none() || value["sid"].as_i64() == sid {
-                                if let Some(last) = last_seq {
-                                    if seq != last + 1 { bail!("sequence gap: {last} -> {seq}"); }
-                                }
-                                last_seq = Some(seq);
+                                check_sequence(&mut last_seq, seq)?;
                             }
                         }
                         if let Some(event) = parse_message(&value)? {
@@ -134,7 +151,7 @@ async fn run_session(
                                 BookEvent::Invalidate(_) => unreachable!(),
                             };
                             if markets.iter().any(|m| m == symbol) {
-                                output.send((shard, event)).await.context("collector event channel closed")?;
+                                output.send((shard, session_epoch, event)).await.context("collector event channel closed")?;
                             }
                         }
                     }
@@ -147,4 +164,49 @@ async fn run_session(
     }
     let _ = socket.send(Message::Close(None)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    #[test]
+    fn detects_missing_and_duplicate_messages() {
+        let mut last = None;
+
+        // Initial message
+        check_sequence(&mut last, 10).unwrap();
+
+        // Correct consecutive messages
+        check_sequence(&mut last, 11).unwrap();
+        check_sequence(&mut last, 12).unwrap();
+
+        // Sequence 13 is missing
+        assert!(check_sequence(&mut last, 14).is_err());
+
+        // A rejected message must not advance the sequence
+        assert_eq!(last, Some(12));
+
+        // Duplicate messages are rejected
+        assert!(check_sequence(&mut last, 12).is_err());
+
+        // The expected message is still accepted
+        check_sequence(&mut last, 13).unwrap();
+    }
+
+    #[test]
+    fn new_subscription_resets_sequence() {
+        let mut last = None;
+
+        check_sequence(&mut last, 100).unwrap();
+        check_sequence(&mut last, 101).unwrap();
+
+        // Fresh WebSocket subscription
+        last = None;
+
+        // A new subscription can start at another number
+        check_sequence(&mut last, 5).unwrap();
+
+        assert_eq!(last, Some(5));
+    }
 }
