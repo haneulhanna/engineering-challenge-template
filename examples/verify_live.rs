@@ -5,7 +5,10 @@ use engineering_challenge::util::dtos::challenge_orderbook::{
 use engineering_challenge::util::{AlignedSbeReader, OrderbookSchema};
 
 fn main() -> Result<()> {
-    let mut reader = AlignedSbeReader::<OrderbookSchema>::open("kalshi-ownership-check.sbe")?;
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "orderbooks.sbe".to_string());
+    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(path.as_str())?;
 
     let mut snapshots = 0;
     let mut updates = 0;
